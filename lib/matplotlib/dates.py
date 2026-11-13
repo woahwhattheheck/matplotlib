@@ -177,6 +177,7 @@ import datetime
 import functools
 import logging
 import re
+import sys
 import zoneinfo
 
 from dateutil.rrule import (rrule, MO, TU, WE, TH, FR, SA, SU, YEARLY,
@@ -400,6 +401,14 @@ def datestr2num(d, default=None):
         return date2num(_dateutil_parser_parse_np_vectorized(d))
 
 
+def _to_utc_naive(dt, timestamp_type):
+    # Only pandas Timestamp promises that to_datetime64() returns the
+    # UTC-normalized value.  Other datetime subclasses keep the normal path.
+    if type(dt) is timestamp_type:
+        return dt.to_datetime64()
+    return dt.astimezone(UTC).replace(tzinfo=None)
+
+
 def date2num(d):
     """
     Convert datetime objects to Matplotlib dates.
@@ -421,8 +430,25 @@ def date2num(d):
     The Gregorian calendar is assumed; this is not universal practice.
     For details see the module docstring.
     """
-    # Unpack in case of e.g. Pandas or xarray object
-    d = cbook._unpack_to_numpy(d)
+    # If pandas created the input, it is already imported.  Do not add a
+    # dependency or import it just to convert ordinary Python datetimes.
+    pandas = sys.modules.get("pandas")
+    try:
+        pandas_datetime = (
+            pandas is not None
+            and type(d) in (pandas.Series, pandas.DatetimeIndex,
+                            pandas.arrays.DatetimeArray)
+            and isinstance(d.dtype, pandas.DatetimeTZDtype))
+    except AttributeError:
+        # pandas may be partially initialized in an import cycle.
+        pandas_datetime = False
+    if pandas_datetime:
+        # Without a dtype, to_numpy() allocates one Timestamp per entry and
+        # discards pandas' vectorized conversion of its underlying UTC values.
+        d = d.to_numpy(dtype="datetime64[us]")
+    else:
+        # Unpack in case of e.g. Pandas or xarray object.
+        d = cbook._unpack_to_numpy(d)
 
     # make an iterable, but save state to unpack later:
     iterable = np.iterable(d)
@@ -439,12 +465,17 @@ def date2num(d):
         if not d.size:
             # deals with an empty array...
             return d
-        tzi = getattr(d[0], 'tzinfo', None)
+        tzi = getattr(d.flat[0], 'tzinfo', None)
         if tzi is not None:
-            # make datetime naive:
-            d = [dt.astimezone(UTC).replace(tzinfo=None) for dt in d]
-            d = np.asarray(d)
-        d = d.astype('datetime64[us]')
+            # Plotting may already have unpacked a container into Timestamp
+            # objects.  Convert these without rebuilding Python datetimes, and
+            # preserve the shape of multidimensional date arrays.
+            timestamp_type = getattr(pandas, "Timestamp", None)
+            d = np.fromiter(
+                (_to_utc_naive(dt, timestamp_type) for dt in d.flat),
+                dtype="datetime64[us]", count=d.size).reshape(d.shape)
+        else:
+            d = d.astype('datetime64[us]')
 
     d = np.ma.masked_array(d, mask=mask) if masked else d
     d = _dt64_to_ordinalf(d)

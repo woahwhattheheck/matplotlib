@@ -1413,3 +1413,71 @@ def test_DateFormatter_settz():
     # Set tzinfo
     formatter.set_tzinfo('Pacific/Kiritimati')
     assert formatter(time) == '2011-Jan-01 14:00'
+
+
+@pytest.mark.parametrize("container", ["index", "series", "array", "objects", "list"])
+@pytest.mark.parametrize("tz", ["UTC", "Europe/Berlin", "America/New_York"])
+def test_date2num_timestamp_conversion(pd, container, tz):
+    # The interval spans the European DST transition from issue #3896.
+    dates = pd.date_range("2014-03-30", periods=6, freq="h", tz="UTC").tz_convert(tz)
+    expected = mdates.date2num(np.datetime64("2014-03-30")) + np.arange(6) / 24
+    values = {
+        "index": dates,
+        "series": pd.Series(dates),
+        "array": dates.array,
+        "objects": dates.to_numpy(),
+        "list": list(dates),
+    }[container]
+    np.testing.assert_allclose(mdates.date2num(values), expected, rtol=0, atol=1e-11)
+
+
+@pytest.mark.parametrize("container", ["index", "series", "array"])
+def test_date2num_timestamp_container_nat(pd, container):
+    dates = pd.DatetimeIndex(
+        [pd.NaT, "2014-03-30T01:00:00", "2014-03-30T03:00:00"], tz="UTC")
+    values = {"index": dates, "series": pd.Series(dates),
+              "array": dates.array}[container]
+    expected = mdates.date2num(
+        np.array(["NaT", "2014-03-30T01:00:00", "2014-03-30T03:00:00"],
+                 dtype="datetime64[us]"))
+    np.testing.assert_equal(mdates.date2num(values), expected)
+
+
+def test_date2num_timestamp_microseconds(pd):
+    # Preserve the microsecond truncation used for timezone-aware objects.
+    dates = pd.DatetimeIndex(["1970-01-01T00:00:00.000001999",
+                             "1969-12-31T23:59:59.999999999"], tz="UTC")
+    expected = mdates.date2num(np.array(["1970-01-01T00:00:00.000001",
+                                       "1969-12-31T23:59:59.999999"],
+                                      dtype="datetime64[us]"))
+    for values in [dates, dates.to_numpy(), list(dates)]:
+        np.testing.assert_equal(mdates.date2num(values), expected)
+
+
+@pytest.mark.parametrize("as_pandas", [False, True])
+def test_date2num_timezone_array_shape(pd, as_pandas):
+    values = [
+        datetime.datetime(2014, 3, 30, hour, tzinfo=datetime.timezone.utc)
+        for hour in range(6)]
+    if as_pandas:
+        values = [pd.Timestamp(value) for value in values]
+    values = np.array(values, dtype=object).reshape(2, 3)
+    expected = (mdates.date2num(np.datetime64("2014-03-30"))
+                + np.arange(6).reshape(2, 3) / 24)
+    np.testing.assert_allclose(mdates.date2num(values), expected, rtol=0, atol=1e-11)
+    masked = np.ma.array(values, mask=[[False, True, False], [True, False, False]])
+    actual = mdates.date2num(masked)
+    np.testing.assert_equal(actual.mask, masked.mask)
+    np.testing.assert_allclose(actual.compressed(),
+                               np.ma.array(expected, mask=masked.mask).compressed(),
+                               rtol=0, atol=1e-11)
+
+
+def test_plot_timestamp_timezone(pd):
+    dates = pd.date_range("2014-03-30", periods=6, freq="h", tz="Europe/Berlin")
+    fig, ax = plt.subplots()
+    line, = ax.plot(dates, np.arange(6))
+    expected = (mdates.date2num(np.datetime64("2014-03-29T23:00:00"))
+                + np.arange(6) / 24)
+    np.testing.assert_allclose(line.get_xdata(orig=False), expected, rtol=0, atol=1e-11)
+    assert ax.xaxis.get_units() == dates[0].tzinfo
