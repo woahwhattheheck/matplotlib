@@ -303,10 +303,10 @@ class RendererBase:
             # Only apply another translation if we have an offset, else we
             # reuse the initial transform.
             if xo != 0 or yo != 0:
-                # The transformation can be used by multiple paths. Since
-                # translate is a inplace operation, we need to copy the
-                # transformation by .frozen() before applying the translation.
-                transform = transform.frozen()
+                # The transformation can be reused, and a frozen transform
+                # (e.g. IdentityTransform) need not support mutation.  Make
+                # a mutable affine copy before applying the translation.
+                transform = Affine2D(transform.get_matrix())
                 transform.translate(xo, yo)
             self.draw_path(gc0, path, transform, rgbFace)
 

@@ -59,6 +59,34 @@ def test_uses_per_path():
     check(id, paths, tforms_matrices, offsets, facecolors[0:1], edgecolors)
 
 
+@pytest.mark.parametrize("master_transform", [
+    transforms.IdentityTransform(),
+    transforms.Affine2D().scale(2, 3).translate(4, 5),
+    transforms.AffineDeltaTransform(
+        transforms.Affine2D().scale(2, 3).translate(4, 5)),
+])
+def test_path_collection_immutable_transform(master_transform):
+    vertices = []
+
+    class RecordingRenderer(RendererBase):
+        def draw_path(self, gc, path, transform, rgbFace=None):
+            vertices.append(transform.transform(path.vertices))
+
+    renderer = RecordingRenderer()
+    shape = path.Path.unit_rectangle()
+    offsets = np.array([[10, 20], [0, 0], [-5, -6]])
+    offset_transform = transforms.Affine2D().scale(2, 3)
+    original_matrix = master_transform.get_matrix().copy()
+    renderer.draw_path_collection(
+        renderer.new_gc(), master_transform, [shape], [], offsets,
+        offset_transform, [(1, 0, 0, 1)], [], [], [], [True], [], "screen")
+
+    expected = (master_transform.transform(shape.vertices)[None, :, :]
+                + offset_transform.transform(offsets)[:, None, :])
+    np.testing.assert_allclose(vertices, expected)
+    np.testing.assert_array_equal(master_transform.get_matrix(), original_matrix)
+
+
 def test_canvas_ctor():
     assert isinstance(FigureCanvasBase().figure, Figure)
 
