@@ -1847,9 +1847,10 @@ end"""
              Op.closepath.value],
             True))]
 
-    def writePath(self, path, transform, clip=False, sketch=None):
+    def writePath(self, path, transform, clip=False, sketch=None, *, padding=0):
         if clip:
-            clip = (0.0, 0.0, self.width * 72, self.height * 72)
+            clip = (-padding, -padding,
+                    self.width * 72 + padding, self.height * 72 + padding)
             simplify = path.should_simplify
         else:
             clip = None
@@ -1985,22 +1986,28 @@ class RendererPdf(_backend_pdf_ps.RendererPDFPSBase):
     def draw_path(self, gc, path, transform, rgbFace=None):
         # docstring inherited
         self.check_gc(gc, rgbFace)
+        # Include the stroke in the clipping bounds, as for marker Forms.
+        padding = 5 * self.gc.get_linewidth() if self.gc.stroke() else 0
         self.file.writePath(
             path, transform,
             rgbFace is None and gc.get_hatch_path() is None,
-            gc.get_sketch_params())
+            gc.get_sketch_params(), padding=padding)
         self.file.output(self.gc.paint(fill_rule=gc._fill_rule))
 
     def draw_path_collection(self, gc, master_transform, paths, all_transforms,
                              offsets, offset_trans, facecolors, edgecolors,
                              linewidths, linestyles, antialiaseds, urls,
                              offset_position, *, hatchcolors=None):
-        # We can only reuse the objects if the presence of fill and
-        # stroke (and the amount of alpha for each) is the same for
-        # all of them
+        # We can reuse the objects if the presence of fill and the amount of
+        # alpha for each paint operation are the same for all of them.  When
+        # linewidths include both zero and positive values, use separate
+        # objects with and without a stroke: a zero-width stroke in PDF is a
+        # hairline, not an invisible edge.
         can_do_optimization = True
         facecolors = np.asarray(facecolors)
         edgecolors = np.asarray(edgecolors)
+        effective_linewidths = np.asarray(
+            linewidths if len(linewidths) else [gc.get_linewidth()])
 
         if hatchcolors is None:
             hatchcolors = []
@@ -2014,25 +2021,24 @@ class RendererPdf(_backend_pdf_ps.RendererPDFPSBase):
             else:
                 can_do_optimization = False
 
-        if not len(edgecolors):
-            stroked = False
-        else:
-            if np.all(np.asarray(linewidths) == 0.0):
-                stroked = False
-            elif np.all(edgecolors[:, 3] == edgecolors[0, 3]):
+        stroked = False
+        if len(edgecolors) and np.any(effective_linewidths > 0):
+            if np.all(edgecolors[:, 3] == edgecolors[0, 3]):
                 stroked = edgecolors[0, 3] != 0.0
             else:
                 can_do_optimization = False
+        mixed_strokes = stroked and not np.all(effective_linewidths > 0)
 
         # Is the optimization worth it? Rough calculation:
         # cost of emitting a path in-line is len_path * uses_per_path
-        # cost of XObject is len_path + 5 for the definition,
-        #    uses_per_path for the uses
+        # cost of each XObject is len_path + 5 for the definition,
+        #    uses_per_path for the uses (shared between paint variants)
         len_path = len(paths[0].vertices) if len(paths) > 0 else 0
         uses_per_path = self._iter_collection_uses_per_path(
             paths, all_transforms, offsets, facecolors, edgecolors)
         should_do_optimization = \
-            len_path + uses_per_path + 5 < len_path * uses_per_path
+            (1 + mixed_strokes) * (len_path + 5) + uses_per_path \
+            < len_path * uses_per_path
 
         if (not can_do_optimization) or (not should_do_optimization):
             return RendererBase.draw_path_collection(
@@ -2041,14 +2047,20 @@ class RendererPdf(_backend_pdf_ps.RendererPDFPSBase):
                 linewidths, linestyles, antialiaseds, urls,
                 offset_position, hatchcolors=hatchcolors)
 
-        padding = np.max(linewidths)
+        # As in writeMarkers, allow for the default PDF miter limit of 10.
+        # The form's bounds must contain the widest stroke that will use it.
+        padding = 5 * np.max(effective_linewidths) if stroked else 0
         path_codes = []
+        unstroked_path_codes = {}
         path_extents = []
         for i, (path, transform) in enumerate(self._iter_collection_raw_paths(
                 master_transform, paths, all_transforms)):
             name = self.file.pathCollectionObject(
                 gc, path, transform, padding, filled, stroked)
             path_codes.append(name)
+            if mixed_strokes:
+                unstroked_path_codes[name] = self.file.pathCollectionObject(
+                    gc, path, transform, 0, filled, False)
             # Compute each transformed path's exact bounds for per-marker
             # canvas checks.  Offsets are not necessarily full canvas-space
             # centers, e.g. for collections using AffineDeltaTransform, so
@@ -2071,12 +2083,20 @@ class RendererPdf(_backend_pdf_ps.RendererPDFPSBase):
 
             # Skip markers completely outside the canvas to reduce PDF size.
             # Use the translated path bounds, not the offset alone: the offset
-            # need not be the marker center in canvas coordinates.
+            # need not be the marker center in canvas coordinates.  Include
+            # the stroke, which may extend into the canvas even if the path
+            # itself is outside it.
             bbox = path_extent_map[path_id]
-            if (bbox.x1 + xo < 0 or bbox.x0 + xo > canvas_width
-                    or bbox.y1 + yo < 0 or bbox.y0 + yo > canvas_height):
+            stroke = gc0.stroke()
+            padding = 5 * gc0.get_linewidth() if stroke else 0
+            if (bbox.x1 + xo + padding < 0
+                    or bbox.x0 + xo - padding > canvas_width
+                    or bbox.y1 + yo + padding < 0
+                    or bbox.y0 + yo - padding > canvas_height):
                 continue
 
+            if mixed_strokes and not stroke:
+                path_id = unstroked_path_codes[path_id]
             self.check_gc(gc0, rgbFace)
             dx, dy = xo - lastx, yo - lasty
             output(1, 0, 0, 1, dx, dy, Op.concat_matrix, path_id,

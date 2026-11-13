@@ -13,13 +13,17 @@ from matplotlib import (
     pyplot as plt, rcParams, font_manager as fm
 )
 from matplotlib.cbook import _get_data_path
+from matplotlib.backend_bases import GraphicsContextBase
+from matplotlib.collections import PathCollection
 from matplotlib.ft2font import FT2Font
 from matplotlib.backends._backend_pdf_ps import get_glyphs_subset, font_as_file
-from matplotlib.backends.backend_pdf import PdfPages
-from matplotlib.patches import Rectangle
+from matplotlib.backends.backend_pdf import PdfFile, PdfPages, RendererPdf
+from matplotlib import path as mpath
+from matplotlib.patches import PathPatch, Rectangle
 from matplotlib.testing import _gen_multi_font_text, _has_tex_package
 from matplotlib.testing.decorators import check_figures_equal, image_comparison
 from matplotlib.testing._markers import needs_usetex
+from matplotlib.transforms import Affine2D, IdentityTransform
 
 
 @image_comparison(['pdf_use14corefonts.pdf'], style='_classic_test')
@@ -759,3 +763,96 @@ def test_hexbin_negative_offsets(fig_test, fig_ref):
     ax_ref.set_xlim(0.0, 4.0)
     ax_ref.set_ylim(0.0, 4.0)
     ax_ref.set_axis_off()
+
+
+@pytest.mark.parametrize("facecolor", ["none", "orange"])
+@check_figures_equal(extensions=["pdf"])
+def test_path_collection_zero_linewidth(fig_test, fig_ref, facecolor):
+    path = mpath.Path.unit_circle().transformed(Affine2D().scale(8))
+    offsets = [(x, y) for y in [48, 96] for x in [24, 72, 120]]
+    for fig in [fig_test, fig_ref]:
+        fig.set_size_inches(2, 2)
+
+    # Enough repetitions to reuse both the stroked and unstroked paths.
+    fig_test.add_artist(PathCollection(
+        [path], offsets=offsets, offset_transform=IdentityTransform(),
+        transform=IdentityTransform(), facecolors=facecolor,
+        edgecolors="black", linewidths=[0, 4], clip_on=False))
+
+    for i, (x, y) in enumerate(offsets):
+        fig_ref.add_artist(PathPatch(
+            path, transform=Affine2D().translate(x, y),
+            facecolor=facecolor, edgecolor="black", linewidth=[0, 4][i % 2],
+            clip_on=False))
+
+
+@pytest.mark.parametrize("bounds", ["canvas", "miter"])
+@check_figures_equal(extensions=["pdf"])
+def test_path_collection_stroke_bounds(fig_test, fig_ref, bounds):
+    for fig in [fig_test, fig_ref]:
+        fig.set_size_inches(2, 2)
+
+    if bounds == "canvas":
+        path = mpath.Path.unit_circle().transformed(Affine2D().scale(4))
+        # Only the strokes, not the paths, intersect the four page edges.
+        offsets = [(-8, 72), (152, 72), (72, -8), (72, 152)]
+        linewidth = 12
+    else:
+        # The acute corner's miter extends farther than one linewidth from
+        # the path.  A tightly bounded PDF Form would clip it.
+        path = mpath.Path([(-20, -3), (0, 0), (-20, 3), (-20, -3)],
+                         [mpath.Path.MOVETO, mpath.Path.LINETO,
+                          mpath.Path.LINETO, mpath.Path.CLOSEPOLY])
+        offsets = [(72, y) for y in [24, 56, 88, 120]]
+        linewidth = 6
+
+    # Different edge colors keep Collection.draw from using draw_markers.
+    edgecolors = ["red", "blue"]
+    fig_test.add_artist(PathCollection(
+        [path], offsets=offsets, offset_transform=IdentityTransform(),
+        transform=IdentityTransform(), facecolors="none",
+        edgecolors=edgecolors, linewidths=linewidth, joinstyle="miter",
+        clip_on=False))
+
+    for i, (x, y) in enumerate(offsets):
+        fig_ref.add_artist(PathPatch(
+            path, transform=Affine2D().translate(x, y), facecolor="none",
+            edgecolor=edgecolors[i % 2], linewidth=linewidth,
+            joinstyle="miter", clip_on=False))
+
+
+@check_figures_equal(extensions=["pdf"])
+def test_path_stroke_canvas_clip(fig_test, fig_ref):
+    paths = [mpath.Path([(-4, 40), (-4, 104)]),
+             mpath.Path([(148, 40), (148, 104)]),
+             mpath.Path([(40, -4), (104, -4)]),
+             mpath.Path([(40, 148), (104, 148)])]
+    for fig, facecolor in [(fig_test, "none"), (fig_ref, "white")]:
+        fig.set_size_inches(2, 2)
+        for path in paths:
+            # Only the strokes intersect the page.  Giving the reference
+            # paths a facecolor bypasses pre-PDF path clipping; two-vertex
+            # paths have zero area, so their fills do not change the image.
+            fig.add_artist(PathPatch(
+                path, transform=IdentityTransform(), facecolor=facecolor,
+                edgecolor="black", linewidth=12, capstyle="butt",
+                clip_on=False))
+
+
+def test_draw_path_base_graphics_context():
+    # draw_path accepts the base graphics context, which has no stroke()
+    # predicate.  The renderer must use its synchronized PDF context.
+    rcParams["pdf.compression"] = 0
+    buf = io.BytesIO()
+    pdf = PdfFile(buf)
+    pdf.newPage(2, 2)
+    renderer = RendererPdf(pdf, 72, 2, 2)
+    gc = GraphicsContextBase()
+    gc.set_linewidth(12)
+    renderer.draw_path(gc, mpath.Path([(-4, 40), (-4, 104)]),
+                       IdentityTransform())
+    renderer.finalize()
+    pdf.finalize()
+    pdf.close()
+    assert b"-4 40 m\n-4 104 l" in buf.getvalue()
+    assert b"\nS\n" in buf.getvalue()
